@@ -23,7 +23,43 @@ def _video(data: dict) -> dict:
 
 
 def _uid(video: dict) -> str | None:
-    return video.get("uid") or video.get("videoUid") or video.get("video_uid") or video.get("id")
+    return (
+        video.get("uid")
+        or video.get("videoUid")
+        or video.get("video_uid")
+        or video.get("videoId")
+        or video.get("id")
+    )
+
+
+def _job_status(payload: dict) -> dict:
+    """Return the backend's nested job status, when it is present."""
+    status = payload.get("jobStatus")
+    return status if isinstance(status, dict) else {}
+
+
+def _job_state(payload: dict, video: dict) -> str | None:
+    """Read state from both legacy and current video-job response shapes."""
+    job_status = _job_status(payload)
+    progress = job_status.get("progress")
+    progress = progress if isinstance(progress, dict) else {}
+    return (
+        job_status.get("state")
+        or job_status.get("status")
+        or progress.get("stage")
+        or payload.get("status")
+        or video.get("status")
+    )
+
+
+def _job_detail(payload: dict) -> str | None:
+    job_status = _job_status(payload)
+    return (
+        job_status.get("failedReason")
+        or job_status.get("message")
+        or payload.get("message")
+        or payload.get("error")
+    )
 
 
 def _select_video(video: dict, session_id: str | None = None) -> None:
@@ -45,6 +81,64 @@ def _video_from_session(session: dict) -> dict:
     return values
 
 
+def _matches_library_search(video: dict, query: str, title: str = "") -> bool:
+    if not query:
+        return True
+    searchable = " ".join(
+        [
+            title,
+            *(str(video.get(key, "")) for key in ("title", "name", "channel", "author", "status")),
+        ]
+    ).lower()
+    return query in searchable
+
+
+def _open_library_item(video: dict, session_id: str | None = None) -> None:
+    video_uid = _uid(video)
+    if not video_uid:
+        st.warning("This item does not include a video identifier in its response.")
+        return
+    try:
+        full_video = client().get_analyzed_video(str(video_uid))
+        _select_video(_video(full_video), session_id)
+        st.rerun()
+    except APIError as error:
+        st.error(f"Could not load this analyzed video: {error}")
+
+
+def _render_video_row(video: dict, index: int) -> None:
+    title = str(video.get("title") or video.get("name") or "Untitled video")
+    col, metadata, action = st.columns([4, 2, 1])
+    with col:
+        st.markdown(f"**{title}**")
+        st.caption("Analyzed video")
+    with metadata:
+        st.caption(video.get("channel") or video.get("author") or "Transcript ready")
+        st.caption(f"Status: {video.get('status', 'ready')}")
+    with action:
+        if st.button("Open chat", key=f"open_video_{index}"):
+            _open_library_item(video)
+
+
+def _render_session_row(session: dict, index: int) -> None:
+    video = _video_from_session(session)
+    session_id = str(session.get("id") or session.get("sessionId") or "") or None
+    title = str(session.get("title") or session.get("name") or "Untitled conversation")
+    video_title = str(video.get("title") or video.get("name") or "Linked analyzed video")
+    col, metadata, action = st.columns([4, 2, 1])
+    with col:
+        st.markdown(f"**{title}**")
+        st.caption(f"Video: {video_title}")
+    with metadata:
+        st.caption("Saved conversation")
+        created_at = session.get("updatedAt") or session.get("createdAt")
+        if created_at:
+            st.caption(f"Last updated: {created_at}")
+    with action:
+        if st.button("Open chat", key=f"open_session_{index}"):
+            _open_library_item(video, session_id)
+
+
 def _library() -> None:
     st.subheader("Your video library")
     try:
@@ -59,26 +153,14 @@ def _library() -> None:
         sessions = []
         st.warning(f"Could not load chat sessions: {error}")
 
-    cards: list[tuple[dict, str | None, str]] = []
-    seen: set[str] = set()
-    for video in videos:
-        uid = _uid(video)
-        if uid:
-            seen.add(str(uid))
-        cards.append((video, None, "Analyzed video"))
-    for session in sessions:
-        video = _video_from_session(session)
-        uid = _uid(video)
-        if uid and str(uid) in seen:
-            continue
-        if uid:
-            seen.add(str(uid))
-        cards.append((video, str(session.get("id") or session.get("sessionId") or "") or None, "Chat session"))
-
-    if not cards:
+    if not videos and not sessions:
         st.info("Your analyzed videos and chat sessions will appear here.")
         return
-    ready_count = sum(str(video.get("status", "")).lower() in {"ready", "completed", "processed", "success"} for video, _, _ in cards)
+    ready_count = sum(
+        str(video.get("status", "")).lower()
+        in {"ready", "completed", "processed", "success"}
+        for video in videos
+    )
     summary = st.columns(3)
     with summary[0]:
         metric_card("Videos", str(len(videos)), "Available to this account")
@@ -88,34 +170,34 @@ def _library() -> None:
         metric_card("Ready to ask", str(ready_count), "Processed transcripts")
     search = st.text_input("Search your library", placeholder="Filter by title, channel, or status")
     query = search.strip().lower()
-    if query:
-        cards = [
-            card for card in cards
-            if query in " ".join(str(card[0].get(key, "")) for key in ("title", "name", "channel", "author", "status")).lower()
-        ]
-    if not cards:
+    filtered_videos = [video for video in videos if _matches_library_search(video, query)]
+    filtered_sessions = [
+        session
+        for session in sessions
+        if _matches_library_search(
+            _video_from_session(session),
+            query,
+            str(session.get("title") or session.get("name") or ""),
+        )
+    ]
+    if query and not filtered_videos and not filtered_sessions:
         st.info("No videos match that search.")
         return
-    for index, (video, session_id, label) in enumerate(cards):
-        title = video.get("title") or video.get("name") or "Untitled video"
-        col, metadata, action = st.columns([4, 2, 1])
-        with col:
-            st.markdown(f"**{title}**")
-            st.caption(label)
-        with metadata:
-            st.caption(video.get("channel") or video.get("author") or "Transcript ready")
-            st.caption(f"Status: {video.get('status', 'ready')}")
-        with action:
-            if st.button("Open", key=f"open_library_{index}"):
-                if not _uid(video) and session_id:
-                    st.warning("This session does not include a video identifier in its response.")
-                else:
-                    try:
-                        full_video = client().get_analyzed_video(str(_uid(video)))
-                        _select_video(_video(full_video), session_id)
-                        st.rerun()
-                    except APIError as error:
-                        st.error(f"Could not load this analyzed video: {error}")
+
+    st.markdown("### Analyzed videos")
+    if filtered_videos:
+        for index, video in enumerate(filtered_videos):
+            _render_video_row(video, index)
+    else:
+        st.caption("No analyzed videos match this search.")
+
+    st.divider()
+    st.markdown("### Chat sessions")
+    if filtered_sessions:
+        for index, session in enumerate(filtered_sessions):
+            _render_session_row(session, index)
+    else:
+        st.caption("No chat sessions match this search.")
 
 
 def render() -> None:
@@ -160,12 +242,20 @@ def render() -> None:
     try:
         payload = client().video_status(job_id)
         video = _video(payload)
+        # The current backend response stores job state under ``jobStatus``:
+        # {jobId, videoId, jobStatus: {state, progress, ...}}.
+        # Keep accepting the former top-level ``status`` shape as well.
+        status = _job_state(payload, video)
+        detail = _job_detail(payload)
+        if status:
+            video = {**video, "status": status}
+        video_uid = _uid(video) or payload.get("videoId")
+        if video_uid and not _uid(video):
+            video = {**video, "uid": video_uid, "videoId": video_uid}
         st.session_state.selected_video = {
             **st.session_state.get("selected_video", {}),
             **video,
         }
-        status = payload.get("status") or video.get("status")
-        detail = payload.get("message") or payload.get("error")
         progress, copy = st.columns([1, 3])
         with progress:
             st.progress(100 if (status or "").lower() in TERMINAL else 45)

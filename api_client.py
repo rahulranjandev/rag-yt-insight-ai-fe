@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Iterator
 
@@ -14,6 +16,33 @@ class APIError(Exception):
     def __init__(self, message: str, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+def clean_chat_text(value: Any) -> str:
+    """Return chat text with common UTF-8/Latin-1 mojibake repaired.
+
+    Some upstream transcript and model providers return UTF-8 text decoded as
+    Latin-1 (for example ``â`` instead of ``—``).  Repair it once at the API
+    boundary so streamed tokens and persisted messages render identically.
+    """
+    text = unicodedata.normalize("NFC", str(value or ""))
+    if any(marker in text for marker in ("Ã", "Â", "â")):
+        try:
+            repaired = text.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            repaired = text
+        else:
+            # Only retain a repair that did not introduce replacement glyphs.
+            if "�" not in repaired:
+                text = repaired
+
+    # A few providers strip the C1 bytes from malformed narrow spaces/dashes.
+    # These narrowly-scoped repairs keep mathematical notation and prose legible.
+    text = text.replace("â¯Ãâ¯", " × ").replace("â¯", " ")
+    text = re.sub(r"(?<=\w)â(?=s\b)", "’", text)
+    text = re.sub(r"(?<=\w)â(?=\w)", "-", text)
+    text = re.sub(r"\sâ\s", " — ", text)
+    return text
 
 
 @dataclass
@@ -124,7 +153,7 @@ class APIClient:
         return self._request("PUT", f"/auth/profile/{user_id}", json=payload)
 
     def get_auth_user(self) -> dict[str, Any]:
-        return self._request("GET", "/auth/user/me")
+        return self._request("GET", "/auth/me")
 
     def refresh_token(self, refreshToken: str) -> dict[str, Any]:
         return self._request(
@@ -141,20 +170,26 @@ class APIClient:
     def get_analyzed_video(self, video_uid: str) -> dict[str, Any]:
         return self._request("GET", f"/videos/{video_uid}")
 
-    def list_analyzed_videos(self) -> list[dict[str, Any]]:
+    def list_analyzed_videos(
+        self,
+    ) -> list[dict[str, Any]]:
         """Return the authenticated user's video library when the API exposes it."""
-        return self.as_list(self._request("GET", "/videos"), "videos", "items", "results")
+        return self.as_list(
+            self._request("GET", "/videos"), "videos", "items", "results"
+        )
 
     # /--------- Chat endpoints ---------/
 
-    def create_session(self, video_uid: str, title: str | None = None) -> dict[str, Any]:
+    def create_session(
+        self, video_uid: str, title: str | None = None
+    ) -> dict[str, Any]:
         payload = {"title": title} if title else {}
-        return self._request(
-            "POST", f"/chat/sessions/{video_uid}", json=payload
-        )
+        return self._request("POST", f"/chat/sessions/{video_uid}", json=payload)
 
     def list_sessions(self) -> list[dict[str, Any]]:
-        return self.as_list(self._request("GET", "/chat/sessions"), "sessions", "items", "results")
+        return self.as_list(
+            self._request("GET", "/chat/sessions"), "sessions", "items", "results"
+        )
 
     def stream_chat(self, session_id: str, question: str) -> Iterator[tuple[str, str]]:
         """Yield (event, payload) from the API's Server-Sent Events response."""
@@ -193,7 +228,9 @@ class APIClient:
     def list_chat_messages(self, session_id: str) -> list[dict[str, Any]]:
         return self.as_list(
             self._request("GET", f"/chat/sessions/{session_id}"),
-            "messages", "items", "results",
+            "messages",
+            "items",
+            "results",
         )
 
     def delete_chat_session(self, session_id: str) -> dict[str, Any]:
@@ -225,9 +262,9 @@ def event_text(payload: str) -> str:
     try:
         data = json.loads(payload)
         if isinstance(data, dict):
-            return str(
+            return clean_chat_text(
                 data.get("token") or data.get("content") or data.get("message") or ""
             )
     except json.JSONDecodeError:
         pass
-    return payload
+    return clean_chat_text(payload)
